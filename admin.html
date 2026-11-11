@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<title>المراسلات - نسخة التجربة</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="common.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+</head>
+<body>
+<div class="trialbar">🧪 نسخة التجربة</div>
+<header class="top"><div class="in">
+  <button class="hb" id="backBtn" hidden aria-label="رجوع">→</button>
+  <h1 id="title">المراسلات</h1>
+  <a class="hb" id="bellBtn" href="#/bell" hidden aria-label="الإشعارات">🔔<span class="cnt" id="bellCnt" hidden></span></a>
+  <button class="hb" id="outBtn" hidden aria-label="خروج">🚪</button>
+</div></header>
+<main class="wrap" id="app"><div class="loading">جاري التحميل…</div></main>
+<nav class="tabs" id="tabs" hidden>
+  <a href="#/" data-tab="list"><span class="i">👥</span>المدرسين</a>
+  <a href="#/bell" data-tab="bell"><span class="i">🔔</span>الإشعارات</a>
+  <a href="#/settings" data-tab="settings" id="setTab" hidden><span class="i">⚙️</span>الإعدادات</a>
+  <a href="index.html"><span class="i">📒</span>الدفتر</a>
+</nav>
+<script>
+"use strict";
+const sb = makeClient(true);
+const app = $('#app');
+let me = null, T = [], notesBy = {}, pendSet = new Set(), staffList = [];
+const ui = { q: '', filter: 'all', rep: '', selMode: false, sel: new Set(), shown: 200, bellTab: 'edits' };
+const isAdmin = () => me && me.role === 'admin';
+const MB = 1048576;
+
+/* ---------- أدوات ---------- */
+function ask(title, { ph = '', val = '', multi = true, okTxt = 'تمام' } = {}) {
+  return new Promise(res => {
+    let done = false;
+    const m = modal(`<h3>${esc(title)}</h3>${multi ? `<textarea id="askv" placeholder="${esc(ph)}">${esc(val)}</textarea>` : `<input class="inp" id="askv" placeholder="${esc(ph)}" value="${esc(val)}">`}
+      <div class="acts"><button class="btn pri" id="askok">${okTxt}</button><button class="btn ghost" data-close>إلغاء</button></div>`,
+      (box, close) => { $('#askv', box).focus(); $('#askok', box).onclick = () => { done = true; const v = $('#askv', box).value.trim(); close(); res(v); }; });
+    const ob = new MutationObserver(() => { if (!document.body.contains(m)) { ob.disconnect(); if (!done) res(null); } });
+    ob.observe(document.body, { childList: true });
+  });
+}
+function norm(s) { return String(s || '').toLowerCase().replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي').replace(/[ً-ْ]/g, ''); }
+function setHeader(t, back) { $('#title').textContent = t; $('#backBtn').hidden = !back; }
+function setTab(t) { $$('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === t)); }
+function repName(id) { const s = staffList.find(x => x.id === id); return s ? s.name : '—'; }
+function inviteLink(t) {
+  const c = getCfg(), base = location.href.split('#')[0].replace(/admin\.html.*$/, '');
+  return base + 'teacher.html#c=' + t.invite_code + (c.custom ? '&p=' + encodeCfg(c.url, c.key) : '');
+}
+function inviteMsg(t) { return `أهلاً أ/ ${t.name} 👋\nده رابط ملفك في «سلاح التلميذ»، افتحه وكمّل بياناتك:\n${inviteLink(t)}`; }
+function avHtml(t, cls = '') { return t.avatar ? `<img class="av ${cls}" src="${t.avatar}" alt="">` : `<span class="av ${cls}">${esc((t.name || '؟').trim()[0] || '👤')}</span>`; }
+async function fetchAll(make) {
+  let out = [];
+  for (let i = 0; ; i += 1000) {
+    const { data, error } = await make().range(i, i + 999);
+    if (error) throw error;
+    out = out.concat(data); if (data.length < 1000) break;
+  }
+  return out;
+}
+function short(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'string') return v.startsWith('data:') ? '(صورة)' : v;
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+const AUD_L = { reason: 'السبب', q: 'السؤال', reply: 'رد المدرس', photos: 'صور', rep: 'المندوب', from: 'من', to: 'إلى', body: 'النص' };
+function auditDetails(d) {
+  if (!d) return '';
+  const p = [];
+  for (const k in d) {
+    const v = d[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && ('o' in v || 'n' in v)) {
+      if (k === 'grades') p.push(...gradesDiff(v.o, v.n)); else p.push(`${FIELD_LABEL[k] || k}: ${short(v.o)} ← ${short(v.n)}`);
+    } else if (k === 'fields' && Array.isArray(v)) p.push('الحقول: ' + v.map(x => FIELD_LABEL[x] || x).join('، '));
+    else if (v !== null && v !== '' && v !== 0) p.push(`${AUD_L[k] || k}: ${short(v)}`);
+  }
+  return p.map(esc).join('<br>');
+}
+
+/* ---------- الدخول ---------- */
+async function boot() {
+  if (!sb) { app.innerHTML = '<div class="alert"><h3>القاعدة لسه مش متظبطة</h3>افتح ملف <b>config.js</b> وحط فيه عنوان ومفتاح Supabase (شوف SETUP.md).</div>' + cfgBox(); bindCfgBox(); return; }
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return renderLogin();
+  await loadMe();
+}
+async function loadMe() {
+  try {
+    const { data: { user } } = await sb.auth.getUser();
+    if (!user) return renderLogin();
+    let { data, error } = await sb.from('staff').select('*').eq('user_id', user.id).maybeSingle();
+    if (error) throw error;
+    if (!data && !user.is_anonymous) {
+      const r = await sb.rpc('claim_admin', { p_name: 'المالك' });
+      if (r.error) return renderLogin(errMsg(r.error));
+      data = r.data;
+    }
+    if (!data || !data.active) return renderLogin(user.is_anonymous ? 'ادخل الرقم السري تاني' : 'الحساب ده مش مسموح له');
+    me = data;
+    $('#bellBtn').hidden = false; $('#outBtn').hidden = false; $('#tabs').hidden = false; $('#setTab').hidden = !isAdmin();
+    await loadAll(); route();
+  } catch (e) { app.innerHTML = `<div class="alert">${esc(errMsg(e))}</div><button class="btn" onclick="boot()">حاول تاني</button>`; }
+}
+function cfgBox() {
+  const c = getCfg();
+  return `<details class="card"><summary>⚙️ قاعدة مختلفة (للمندوب اللي ليه قاعدة لوحده)</summary>
+    <div class="hint small muted" style="margin:8px 0">الصق «كود إعداد القاعدة» اللي بعتهولك المالك.</div>
+    <textarea id="cfgIn" placeholder="كود الإعداد"></textarea>
+    <div class="acts"><button class="btn" id="cfgSave">حفظ</button>${c.custom ? '<button class="btn ghost" id="cfgReset">رجّع القاعدة الأساسية</button>' : ''}</div></details>`;
+}
+function bindCfgBox() {
+  const s = $('#cfgSave'); s && (s.onclick = () => { const c = decodeCfg($('#cfgIn').value); if (!c) return toast('الكود ده مش صح'); LS.set(CFG_KEY, c); location.reload(); });
+  const r = $('#cfgReset'); r && (r.onclick = () => { LS.del(CFG_KEY); location.reload(); });
+}
+function renderLogin(msg) {
+  me = null; $('#tabs').hidden = true; $('#bellBtn').hidden = true; $('#outBtn').hidden = true; setHeader('المراسلات 🔒', false);
+  app.innerHTML = `${msg ? `<div class="alert">${esc(msg)}</div>` : ''}
+  <div class="chips"><button class="chip on" data-lt="rep">🔑 مندوب</button><button class="chip" data-lt="admin">👑 المالك</button></div>
+  <div class="card" id="lrep"><h3>ادخل الرقم السري بتاعك</h3>
+    <input class="inp" id="code" inputmode="numeric" autocomplete="off" placeholder="الرقم السري (8 أرقام)" style="font-size:22px;text-align:center;letter-spacing:4px">
+    <div class="hint small muted">الرقم بيشتغل على أول موبايل بس. لو غيّرت الموبايل اطلب من المالك يفك الربط.</div>
+    <button class="btn pri" id="goRep" style="width:100%;margin-top:10px">دخول</button></div>
+  <div class="card" id="ladm" hidden><h3>دخول المالك</h3>
+    <div class="field"><label>الإيميل</label><input id="em" type="email" autocomplete="username" dir="ltr"></div>
+    <div class="field"><label>الباسورد</label><input id="pw" type="password" autocomplete="current-password" dir="ltr"></div>
+    <button class="btn pri" id="goAdm" style="width:100%">دخول</button></div>
+  ${cfgBox()}<a class="btn ghost" href="index.html">→ رجوع للدفتر</a>`;
+  bindCfgBox();
+  $$('[data-lt]').forEach(b => b.onclick = () => { $$('[data-lt]').forEach(x => x.classList.toggle('on', x === b)); $('#lrep').hidden = b.dataset.lt !== 'rep'; $('#ladm').hidden = b.dataset.lt === 'rep'; });
+  $('#goRep').onclick = async () => {
+    const code = $('#code').value.replace(/\D/g, ''); if (code.length < 6) return toast('اكتب الرقم صح');
+    const b = $('#goRep'); b.disabled = true;
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      if (session && !session.user.is_anonymous) await sb.auth.signOut();
+      if (!session || !session.user.is_anonymous) { const r = await sb.auth.signInAnonymously(); if (r.error) throw r.error; }
+      const { error } = await sb.rpc('claim_rep', { p_code: code, p_device: deviceId() });
+      if (error) throw error;
+      await loadMe();
+    } catch (e) { b.disabled = false; toast(errMsg(e), 4000); }
+  };
+  $('#goAdm').onclick = async () => {
+    const b = $('#goAdm'); b.disabled = true;
+    const { error } = await sb.auth.signInWithPassword({ email: $('#em').value.trim(), password: $('#pw').value });
+    if (error) { b.disabled = false; return toast(/Invalid login/i.test(error.message) ? 'الإيميل أو الباسورد غلط' : errMsg(error), 4000); }
+    await loadMe();
+  };
+}
+$('#outBtn').onclick = async () => {
+  if (!confirm(me && me.role === 'rep' ? 'تخرج؟ هتحتاج الرقم السري تاني (على نفس الموبايل).' : 'تسجيل خروج؟')) return;
+  await sb.auth.signOut(); me = null; renderLogin();
+};
+$('#backBtn').onclick = () => { if (history.length > 1) history.back(); else location.hash = '#/'; };
+
+/* ---------- البيانات ---------- */
+async function loadAll() {
+  const [t, n, p, s] = await Promise.all([
+    fetchAll(() => sb.from('teachers').select('id,name,phone,rep_id,enabled,invite_code,profile,last_seen,created_at').order('name')),
+    fetchAll(() => sb.from('teacher_notes').select('teacher_id,body')),
+    fetchAll(() => sb.from('edit_requests').select('teacher_id').eq('status', 'pending')),
+    isAdmin() ? fetchAll(() => sb.from('staff').select('id,name,role,active').order('created_at')) : Promise.resolve([me])
+  ]);
+  T = t; staffList = s; notesBy = {}; n.forEach(x => (notesBy[x.teacher_id] ||= []).push(x.body));
+  pendSet = new Set(p.map(x => x.teacher_id));
+  const c = p.length; $('#bellCnt').hidden = !c; $('#bellCnt').textContent = c;
+}
+async function refresh() { try { await loadAll(); route(); } catch (e) { toast(errMsg(e)); } }
+
+/* ---------- التوجيه ---------- */
+function route() {
+  if (!me) return;
+  const h = location.hash.slice(1) || '/';
+  if (h.startsWith('/t/')) { setTab('list'); return viewTeacher(decodeURIComponent(h.slice(3))); }
+  if (h === '/bell') { setTab('bell'); return viewBell(); }
+  if (h === '/settings' && isAdmin()) { setTab('settings'); return viewSettings(); }
+  setTab('list'); viewList();
+}
+window.addEventListener('hashchange', () => { route(); scrollTo(0, 0); });
+
+/* ---------- قائمة المدرسين ---------- */
+function filtered() {
+  const q = norm(ui.q);
+  return T.filter(t => {
+    if (ui.rep && t.rep_id !== ui.rep) return false;
+    if (ui.filter === 'notes' && !notesBy[t.id]) return false;
+    if (ui.filter === 'pend' && !pendSet.has(t.id)) return false;
+    if (ui.filter === 'off' && t.enabled) return false;
+    if (!q) return true;
+    const pr = t.profile || {};
+    const hay = norm([t.name, t.phone, pr.subject, pr.gov, pr.city, pr.place, gradesText(pr.grades), ...(notesBy[t.id] || [])].join(' '));
+    return q.split(/\s+/).every(w => hay.includes(w));
+  });
+}
+function viewList() {
+  setHeader(`المدرسين — ${me.name}`, false);
+  const list = filtered(), nNotes = T.filter(t => notesBy[t.id]).length;
+  const chip = (k, txt) => `<button class="chip ${ui.filter === k ? 'on' : ''}" data-f="${k}">${txt}</button>`;
+  app.innerHTML = `<div class="search"><input id="q" type="search" placeholder="🔍 دوّر بالاسم أو الرقم أو المنطقة أو الرسائل المحفوظة" value="${esc(ui.q)}"></div>
+  <div class="chips">${chip('all', `الكل (${T.length})`)}${chip('notes', `📌 رسائل محفوظة (${nNotes})`)}${chip('pend', `⏳ تعديلات (${pendSet.size})`)}${chip('off', '⛔ موقوفين')}
+   ${isAdmin() && staffList.length > 1 ? `<select class="chip" id="repF"><option value="">كل المناديب</option>${staffList.map(s => `<option value="${s.id}" ${ui.rep === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>` : ''}</div>
+  <div class="acts" style="margin:0 0 10px"><button class="btn sm pri" id="add1">➕ مدرس</button><button class="btn sm" id="addMany">📋 إضافة بالجملة</button>
+   <button class="btn sm ${ui.selMode ? 'pri' : ''}" id="selT">☑️ تحديد</button><button class="btn sm" id="updAll">🔄 اطلب تحديث للظاهرين (${list.length})</button></div>
+  <div class="tlist" id="tl">${list.slice(0, ui.shown).map(tItem).join('') || '<div class="empty">مفيش مدرسين هنا</div>'}</div>
+  ${list.length > ui.shown ? `<button class="btn ghost" id="more" style="width:100%;margin-top:10px">اعرض أكتر (${list.length - ui.shown})</button>` : ''}
+  <div id="selbar"></div>`;
+  const qi = $('#q');
+  qi.oninput = () => { ui.q = qi.value; ui.shown = 200; const l = filtered(); $('#tl').innerHTML = l.slice(0, ui.shown).map(tItem).join('') || '<div class="empty">مفيش نتائج</div>'; $('#updAll').textContent = `🔄 اطلب تحديث للظاهرين (${l.length})`; };
+  $$('[data-f]').forEach(b => b.onclick = () => { ui.filter = b.dataset.f; ui.shown = 200; viewList(); });
+  const rf = $('#repF'); rf && (rf.onchange = () => { ui.rep = rf.value; viewList(); });
+  $('#add1').onclick = addOne; $('#addMany').onclick = addMany;
+  $('#selT').onclick = () => { ui.selMode = !ui.selMode; ui.sel.clear(); viewList(); };
+  $('#updAll').onclick = () => { const l = filtered(); if (!l.length) return; reqUpdateDlg(l.map(t => t.id)); };
+  const mo = $('#more'); mo && (mo.onclick = () => { ui.shown += 300; viewList(); });
+  $('#tl').onclick = e => {
+    const it = e.target.closest('.titem'); if (!it) return;
+    if (ui.selMode) { const id = it.dataset.id; ui.sel.has(id) ? ui.sel.delete(id) : ui.sel.add(id); it.classList.toggle('sel'); drawSelbar(); }
+    else location.hash = '#/t/' + it.dataset.id;
+  };
+  drawSelbar(); if (ui.q) { qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); }
+}
+function tItem(t) {
+  const pr = t.profile || {}, nn = (notesBy[t.id] || []).length;
+  return `<div class="titem ${ui.sel.has(t.id) ? 'sel' : ''}" data-id="${t.id}">${avHtml(t)}<div class="grow"><div class="nm">${esc(t.name)}</div>
+    <div class="sub">${esc([t.phone, pr.subject, pr.city].filter(Boolean).join(' · '))}${isAdmin() ? ' · ' + esc(repName(t.rep_id)) : ''}</div></div>
+    ${pendSet.has(t.id) ? '<span class="pill owe">⏳</span>' : ''}${nn ? `<span class="pill new">📌${nn}</span>` : ''}${t.enabled ? '' : '<span class="pill bad">⛔</span>'}${t.last_seen ? '' : '<span class="pill new" title="لسه ما فتحش">جديد</span>'}</div>`;
+}
+function drawSelbar() {
+  const b = $('#selbar'); if (!b) return;
+  if (!ui.selMode) { b.innerHTML = ''; return; }
+  const n = ui.sel.size;
+  b.innerHTML = `<div class="selbar"><div class="in"><b>${n} متحدد</b>
+    <button class="btn sm ghost" id="sAll">تحديد الظاهرين</button>
+    <button class="btn sm" id="sCopy" ${n ? '' : 'disabled'}>🔗 انسخ الروابط</button>
+    <button class="btn sm ok" id="sWa" ${n ? '' : 'disabled'}>🟢 واتساب</button>
+    <button class="btn sm owe" id="sUpd" ${n ? '' : 'disabled'}>🔄 اطلب تحديث</button>
+    <button class="btn sm ghost" id="sX">✕</button></div></div>`;
+  const pick = () => T.filter(t => ui.sel.has(t.id));
+  $('#sAll').onclick = () => { filtered().slice(0, ui.shown).forEach(t => ui.sel.add(t.id)); viewList(); };
+  $('#sCopy').onclick = () => copyText(pick().map(t => `${t.name}: ${inviteLink(t)}`).join('\n'));
+  $('#sWa').onclick = () => waBulk(pick());
+  $('#sUpd').onclick = () => reqUpdateDlg([...ui.sel]);
+  $('#sX').onclick = () => { ui.selMode = false; ui.sel.clear(); viewList(); };
+}
+function waBulk(list) {
+  modal(`<h3>🟢 ابعت الروابط واتساب (${list.length})</h3><div class="hint small muted" style="margin-bottom:8px">اضغط «ابعت» لكل مدرس، هيفتح الواتساب برسالته جاهزة.</div>
+    <div class="tlist" style="display:flex">${list.map((t, i) => `<div class="titem" style="cursor:default"><div class="grow"><b>${esc(t.name)}</b><div class="sub">${esc(t.phone || 'مفيش رقم')}</div></div>
+      ${t.phone ? `<a class="btn sm ok" target="_blank" rel="noopener" data-i="${i}" href="${waLink(t.phone, inviteMsg(t))}">ابعت</a>` : `<button class="btn sm" data-c="${i}">انسخ</button>`}</div>`).join('')}</div>
+    <div class="acts"><button class="btn" id="cpAll">📋 انسخ كل الرسايل</button><button class="btn ghost" data-close>قفل</button></div>`, box => {
+    box.addEventListener('click', e => {
+      const a = e.target.closest('[data-i]'); if (a) { a.textContent = '✓ اتبعت'; a.classList.replace('ok', 'ghost'); }
+      const c = e.target.closest('[data-c]'); if (c) copyText(inviteMsg(list[+c.dataset.c]));
+    });
+    $('#cpAll', box).onclick = () => copyText(list.map(inviteMsg).join('\n\n'));
+  });
+}
+function repSelect(cur) {
+  if (!isAdmin()) return '';
+  return `<div class="field"><label>المندوب</label><select id="repSel">${staffList.filter(s => s.active).map(s => `<option value="${s.id}" ${s.id === cur ? 'selected' : ''}>${esc(s.name)}${s.role === 'admin' ? ' (أنا)' : ''}</option>`).join('')}</select></div>`;
+}
+function addOne() {
+  modal(`<h3>➕ مدرس جديد</h3><div class="field"><label>الاسم</label><input id="nn"></div>
+    <div class="field"><label>رقم التليفون (واتساب)</label><input id="np" type="tel" inputmode="tel"></div>${repSelect(me.id)}
+    <div class="acts"><button class="btn pri" id="ns">حفظ</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+    $('#nn', box).focus();
+    $('#ns', box).onclick = async () => {
+      const name = $('#nn', box).value.trim(), phone = $('#np', box).value.trim(); if (!name) return toast('اكتب الاسم');
+      const row = { name, phone, profile: { name, phone } }; const rs = $('#repSel', box); if (rs) row.rep_id = rs.value;
+      const { data, error } = await sb.from('teachers').insert(row).select('id').single();
+      if (error) return toast(errMsg(error));
+      close(); await loadAll(); location.hash = '#/t/' + data.id;
+    };
+  });
+}
+function parseLines(txt) {
+  return txt.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => {
+    const m = l.match(/(\+?\d[\d\s-]{8,}\d)/); const phone = m ? m[1].replace(/[\s-]/g, '') : '';
+    const name = (m ? l.replace(m[1], '') : l).replace(/[,،\-–:|\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return { name, phone };
+  }).filter(x => x.name);
+}
+function addMany() {
+  modal(`<h3>📋 إضافة مدرسين بالجملة</h3><div class="hint small muted">كل مدرس في سطر: الاسم والرقم (مثال: أحمد علي 01012345678). ينفع تلصق من إكسيل.</div>
+    <textarea id="bl" style="min-height:180px;margin-top:8px"></textarea>${repSelect(me.id)}<div id="bp" class="small muted"></div>
+    <div class="acts"><button class="btn pri" id="bs">إضافة</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+    $('#bl', box).oninput = () => { $('#bp', box).textContent = parseLines($('#bl', box).value).length + ' مدرس'; };
+    $('#bs', box).onclick = async () => {
+      const rows = parseLines($('#bl', box).value); if (!rows.length) return toast('مفيش أسماء');
+      const rs = $('#repSel', box), b = $('#bs', box); b.disabled = true;
+      const ids = [];
+      for (let i = 0; i < rows.length; i += 300) {
+        const chunk = rows.slice(i, i + 300).map(r => ({ ...r, profile: { name: r.name, phone: r.phone }, ...(rs ? { rep_id: rs.value } : {}) }));
+        const { data, error } = await sb.from('teachers').insert(chunk).select('id');
+        if (error) { b.disabled = false; return toast(errMsg(error)); }
+        ids.push(...data.map(x => x.id));
+      }
+      close(); await loadAll(); toast(`اتضاف ${ids.length} مدرس ✅`);
+      ui.selMode = true; ui.sel = new Set(ids); ui.filter = 'all'; ui.q = ''; location.hash = '#/'; viewList();
+      toast('المدرسين الجداد متحددين — ابعتلهم الروابط من الشريط تحت', 4000);
+    };
+  });
+}
+function reqUpdateDlg(ids) {
+  modal(`<h3>🔄 اطلب تحديث بيانات (${ids.length} مدرس)</h3><div class="small muted" style="margin-bottom:6px">اختار الحاجات المطلوبة:</div>
+    <div class="chips" style="flex-wrap:wrap">${REQ_FIELDS.map(k => `<label class="chip"><input type="checkbox" value="${k}"> ${FIELD_LABEL[k]}</label>`).join('')}</div>
+    <div class="field"><label>ملاحظة للمدرس (اختياري)</label><textarea id="rn"></textarea></div>
+    <div class="acts"><button class="btn pri" id="rs">ابعت الطلب</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+    $('#rs', box).onclick = async () => {
+      const f = $$('input:checked', box).map(i => i.value); if (!f.length) return toast('اختار حاجة واحدة على الأقل');
+      const { data, error } = await sb.rpc('request_update', { p_ids: ids, p_fields: f, p_note: $('#rn', box).value });
+      if (error) return toast(errMsg(error));
+      close(); toast(`اتبعت لـ ${data} مدرس ✅`); if (location.hash.startsWith('#/t/')) route();
+    };
+  });
+}
+
+/* ---------- صفحة المدرس ---------- */
+async function viewTeacher(id) {
+  setHeader('ملف المدرس', true); app.innerHTML = '<div class="loading">جاري التحميل…</div>';
+  const [tR, nR, aR, eR, uR] = await Promise.all([
+    sb.from('teachers').select('*').eq('id', id).maybeSingle(),
+    sb.from('teacher_notes').select('*').eq('teacher_id', id).order('created_at', { ascending: false }),
+    sb.from('audit_log').select('*').eq('teacher_id', id).order('created_at', { ascending: false }).limit(100),
+    sb.from('edit_requests').select('*').eq('teacher_id', id).in('status', ['pending', 'question']).order('created_at'),
+    sb.from('update_requests').select('*').eq('teacher_id', id).eq('status', 'open').order('created_at', { ascending: false })
+  ]);
+  const err = [tR, nR, aR, eR, uR].find(r => r.error); if (err) { app.innerHTML = `<div class="alert">${esc(errMsg(err.error))}</div>`; return; }
+  const t = tR.data; if (!t) { app.innerHTML = '<div class="empty">المدرس ده مش موجود</div>'; return; }
+  setHeader(t.name, true);
+  const pr = t.profile || {}, link = inviteLink(t);
+  app.innerHTML = `<div class="card"><div style="display:flex;gap:12px;align-items:center">${avHtml(t, 'lg')}<div class="grow">
+      <b style="font-size:20px">${esc(t.name)}</b><div class="small muted">${t.phone ? `<a href="tel:${esc(t.phone)}">${esc(t.phone)}</a> · ` : ''}${t.last_seen ? 'آخر دخول ' + fmtDate(t.last_seen) : 'لسه ما فتحش الرابط'}</div>
+      ${isAdmin() ? `<div class="small muted">المندوب: ${esc(repName(t.rep_id))}</div>` : ''}${t.enabled ? '' : '<span class="pill bad">⛔ الرابط موقوف</span>'}</div></div>
+    <div style="margin-top:10px">${FIELDS.filter(f => !['name', 'avatar', 'phone'].includes(f.k)).map(f => `<div class="kv"><span>${f.l}</span><span>${fmtVal(f.k, pr[f.k])}</span></div>`).join('')}</div>
+    <div class="acts"><button class="btn sm pri" id="ed">✏️ تعديل مباشر</button><button class="btn sm" id="cp">🔗 انسخ الرابط</button>
+      ${t.phone ? `<a class="btn sm ok" target="_blank" rel="noopener" href="${waLink(t.phone, inviteMsg(t))}">🟢 ابعت الرابط</a>` : ''}
+      <button class="btn sm owe" id="ru">🔄 اطلب تحديث</button><button class="btn sm ghost" id="en">${t.enabled ? '⛔ إيقاف الرابط' : '✅ تفعيل الرابط'}</button>
+      <button class="btn sm ghost" id="nc">♻️ رابط جديد</button>
+      ${isAdmin() ? '<button class="btn sm ghost" id="tr">🔁 نقل لمندوب</button><button class="btn sm danger" id="del">🗑️ حذف</button>' : ''}</div></div>
+  ${uR.data.length ? `<div class="alert"><h3>طلبات تحديث مفتوحة</h3>${uR.data.map(u => `<div class="kv"><span>${esc(u.fields.map(k => FIELD_LABEL[k] || k).join('، '))}${u.note ? ' — ' + esc(u.note) : ''}<br><span class="small">${fmtDate(u.created_at)}</span></span><button class="btn sm ghost" data-ucancel="${u.id}">إلغاء</button></div>`).join('')}</div>` : ''}
+  <div id="reqs">${eR.data.map(e => reviewCard({ ...e, teachers: { name: t.name, avatar: t.avatar } }, true)).join('')}</div>
+  <div class="card"><h3>📌 رسائل المدرس <span class="small muted">(ليك بس، المدرس مش بيشوفها)</span></h3>
+    <textarea id="nt" placeholder="اكتب ملاحظة تتحفظ في سجل المدرس…"></textarea>
+    <div class="acts"><button class="btn sm pri" id="ns">حفظ</button><button class="btn sm danger" id="ndel" hidden>🗑️ امسح المحدد</button></div>
+    <div id="nl" style="margin-top:8px">${nR.data.map(n => `<label class="kv" style="justify-content:flex-start;gap:8px;cursor:pointer"><input type="checkbox" value="${n.id}">
+      <span style="flex:1;color:var(--ink)">${n.kind === 'msg' ? `💬 <b>${esc(n.sender || '')}</b>: ` : '📝 '}${esc(n.body)}<br><span class="small muted">${fmtDate(n.msg_at || n.created_at)}</span></span></label>`).join('') || '<div class="small muted">لسه مفيش</div>'}</div></div>
+  <details class="card"><summary><b>🧾 سجل التعديلات (${aR.data.length})</b></summary>${aR.data.map(a => `<div class="kv" style="display:block"><b>${esc(a.action)}</b> <span class="small muted">— ${esc(a.actor_name || '')} · ${fmtDate(a.created_at)}</span><div class="small">${auditDetails(a.details)}</div></div>`).join('') || '<div class="small muted">فاضي</div>'}</details>`;
+
+  $('#ed').onclick = () => directEdit(t);
+  $('#cp').onclick = () => copyText(link);
+  $('#ru').onclick = () => reqUpdateDlg([t.id]);
+  $('#en').onclick = async () => { const { error } = await sb.from('teachers').update({ enabled: !t.enabled }).eq('id', t.id); if (error) return toast(errMsg(error)); await refresh(); };
+  $('#nc').onclick = async () => {
+    if (!confirm('الرابط القديم هيبطل يشتغل. متأكد؟')) return;
+    const { error } = await sb.from('teachers').update({ invite_code: Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7) }).eq('id', t.id);
+    if (error) return toast(errMsg(error)); await refresh(); toast('اتعمل رابط جديد — ابعته للمدرس');
+  };
+  const tr = $('#tr'); tr && (tr.onclick = () => modal(`<h3>🔁 نقل ${esc(t.name)}</h3>${repSelect(t.rep_id)}<div class="acts"><button class="btn pri" id="trs">نقل</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+    $('#trs', box).onclick = async () => { const { error } = await sb.from('teachers').update({ rep_id: $('#repSel', box).value }).eq('id', t.id); if (error) return toast(errMsg(error)); close(); await refresh(); toast('اتنقل ✅'); };
+  }));
+  const dl = $('#del'); dl && (dl.onclick = async () => {
+    if (!confirm(`حذف ${t.name} نهائيًا؟ (ملاحظاته وطلباته هتتمسح، السجل يفضل)`)) return;
+    const { error } = await sb.from('teachers').delete().eq('id', t.id); if (error) return toast(errMsg(error));
+    await loadAll(); location.hash = '#/';
+  });
+  $$('[data-ucancel]').forEach(b => b.onclick = async () => { await sb.from('update_requests').update({ status: 'done', done_at: new Date().toISOString() }).eq('id', b.dataset.ucancel); route(); });
+  $('#ns').onclick = async () => {
+    const body = $('#nt').value.trim(); if (!body) return;
+    const { error } = await sb.from('teacher_notes').insert({ teacher_id: t.id, body, kind: 'note', sender: me.name }); if (error) return toast(errMsg(error));
+    (notesBy[t.id] ||= []).push(body); route();
+  };
+  $('#nl').onchange = () => { $('#ndel').hidden = !$$('#nl input:checked').length; };
+  $('#ndel').onclick = async () => {
+    const ids = $$('#nl input:checked').map(i => i.value);
+    if (!confirm(`هيتمسح ${ids.length} من رسائل المدرس نهائيًا. متأكد؟`)) return;
+    const { error } = await sb.from('teacher_notes').delete().in('id', ids); if (error) return toast(errMsg(error));
+    await refresh();
+  };
+  bindReviews($('#reqs'));
+}
+function directEdit(t) {
+  const st = {}, base = { ...(t.profile || {}), avatar: t.avatar || '' };
+  modal(`<h3>✏️ تعديل مباشر — ${esc(t.name)}</h3><div class="small muted" style="margin-bottom:8px">التعديل ده بيتسجل في سجل التعديلات باسمك.</div>
+    <form id="df" onsubmit="return false">${profileForm(base)}</form>
+    <div class="acts"><button class="btn pri" id="ds">حفظ</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+    const f = $('#df', box); bindProfileForm(f, st);
+    $('#ds', box).onclick = async () => {
+      const ch = changedOnly(base, readProfileForm(f, st)); if (!Object.keys(ch).length) return close();
+      if ('name' in ch && !String(ch.name).trim()) return toast('الاسم مينفعش يبقى فاضي');
+      const upd = { profile: { ...(t.profile || {}), ...ch } }; delete upd.profile.avatar;
+      if (ch.avatar) upd.avatar = ch.avatar;
+      const { error } = await sb.from('teachers').update(upd).eq('id', t.id); if (error) return toast(errMsg(error));
+      close(); await refresh(); toast('اتحفظ ✅');
+    };
+  });
+}
+
+/* ---------- المراجعة ---------- */
+const REQS = {};
+function diffRows(e) {
+  const nv = e.new_values || {}, ov = e.old_values || {};
+  return Object.keys(nv).map(k => {
+    if (k === 'grades') return `<tr><td>${FIELD_LABEL[k]}</td><td>${gradesDiff(ov[k], nv[k]).map(esc).join('<br>') || 'بدون تغيير'}</td></tr>`;
+    return `<tr><td>${FIELD_LABEL[k] || k}</td><td><span class="o">${fmtVal(k, ov[k])}</span> ← <span class="n">${fmtVal(k, nv[k])}</span></td></tr>`;
+  }).join('');
+}
+function reviewCard(e, inTeacher) {
+  REQS[e.id] = e;
+  const t = e.teachers || {}, ph = e.photos || [];
+  return `<div class="card" data-req="${e.id}" style="border-color:var(--owe)">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">${avHtml(t)}<div class="grow">
+      ${inTeacher ? '<b>📝 طلب تعديل</b>' : `<a href="#/t/${e.teacher_id}"><b>${esc(t.name || '')}</b></a>`}<div class="small muted">${fmtDate(e.updated_at)}</div></div>
+      ${e.status === 'question' ? '<span class="pill owe">❓ مستني رده</span>' : '<span class="pill new">جديد</span>'}</div>
+    ${e.status === 'question' || (e.reason && e.teacher_reply) ? `<div class="small">❓ سؤالك: ${esc(e.reason || '')}</div>` : ''}
+    ${e.teacher_reply ? `<div class="good small" style="padding:8px;margin:6px 0">💬 رد المدرس: ${esc(e.teacher_reply)}</div>` : ''}
+    ${Object.keys(e.new_values || {}).length ? `<table class="diff">${diffRows(e)}</table>` : ''}
+    ${ph.length ? `<div class="small muted" style="margin:8px 0 4px">📷 ${ph.length} صورة — علّم اللي عايز تحتفظ بيها (هتتنزل على جهازك، والباقي يتمسح):</div>
+      <div class="photos">${ph.map(p => `<label class="ph on"><img src="${p.d}" alt=""><input type="checkbox" checked data-ph="${p.id}"></label>`).join('')}</div>` : ''}
+    <div class="acts"><button class="btn sm ok" data-act="approve">✅ موافقة</button><button class="btn sm" data-act="edit">✏️ عدّل ووافق</button>
+      <button class="btn sm danger" data-act="reject">❌ رفض</button><button class="btn sm ghost" data-act="question">❓ اسأله</button></div></div>`;
+}
+function bindReviews(root) {
+  root.addEventListener('change', e => { const c = e.target.closest('[data-ph]'); if (c) c.parentNode.classList.toggle('on', c.checked); });
+  root.addEventListener('click', async e => {
+    const b = e.target.closest('[data-act]'); if (!b) return;
+    const card = b.closest('[data-req]'), r = REQS[card.dataset.req], act = b.dataset.act;
+    const keep = $$('[data-ph]:checked', card).map(c => c.dataset.ph);
+    const photos = (r.photos || []).filter(p => keep.includes(p.id));
+    const savePhotos = () => photos.forEach((p, i) => downloadDataUrl(p.d, `${(r.teachers && r.teachers.name || 'مدرس').replace(/[\\/:*?"<>|]/g, '')}-${new Date().toISOString().slice(0, 10)}-${i + 1}.jpg`));
+    const send = async (action, final, reason) => {
+      $$('button', card).forEach(x => x.disabled = true);
+      const { error } = await sb.rpc('review_edit', { p_id: r.id, p_action: action, p_final: final || null, p_reason: reason || null });
+      if (error) { $$('button', card).forEach(x => x.disabled = false); return toast(errMsg(error), 4000); }
+      card.remove(); toast('تمام ✅'); loadAll().then(() => { if (!location.hash.startsWith('#/bell')) route(); });
+    };
+    if (act === 'approve') {
+      if ((r.photos || []).length && !confirm(`${photos.length} صورة هتتنزل على جهازك و${r.photos.length - photos.length} هتتمسح. موافق؟`)) return;
+      savePhotos(); send('approve');
+    } else if (act === 'edit') {
+      const st = {}, keys = Object.keys(r.new_values || {});
+      if (!keys.length) { savePhotos(); return send('approve'); }
+      modal(`<h3>✏️ عدّل قبل الموافقة</h3><div class="small muted" style="margin-bottom:8px">المدرس هيشوف اللي إنت غيّرته.</div>
+        <form id="ef" onsubmit="return false">${profileForm(r.new_values, { only: keys })}</form>
+        <div class="acts"><button class="btn ok" id="es">✅ وافق بالتعديل</button><button class="btn ghost" data-close>إلغاء</button></div>`, (box, close) => {
+        const f = $('#ef', box); bindProfileForm(f, st);
+        $('#es', box).onclick = () => {
+          const v = readProfileForm(f, st), fin = {};
+          keys.forEach(k => { fin[k] = k === 'avatar' ? (st.avatar || r.new_values.avatar) : v[k]; });
+          close(); savePhotos(); send('edit', fin);
+        };
+      });
+    } else if (act === 'reject') {
+      const why = await ask('❌ سبب الرفض (المدرس هيشوفه)', { ph: 'مثلاً: الرقم ناقص' }); if (why === null) return;
+      send('reject', null, why);
+    } else if (act === 'question') {
+      const q = await ask('❓ اكتب سؤالك للمدرس', { ph: 'مثلاً: السنتر ده في أنهي شارع؟' }); if (!q) return;
+      send('question', null, q);
+    }
+  });
+}
+
+/* ---------- الجرس ---------- */
+const BELL = [['orders', '🛒 طلبات المدرسين'], ['mine', '🧾 طلباتي'], ['notes', '📋 الملاحظات'], ['edits', '📝 تعديل الملفات'], ['del', '🗑️ مسح الرسايل'], ['msgs', '💬 رسايل جديدة']];
+async function viewBell() {
+  setHeader('🔔 الإشعارات', false);
+  const n = pendSet.size;
+  app.innerHTML = `<div class="chips">${BELL.map(([k, l]) => `<button class="chip ${ui.bellTab === k ? 'on' : ''} ${k === 'edits' ? '' : 'soon'}" data-b="${k}">${l}${k === 'edits' && n ? `<span class="n">${$('#bellCnt').textContent}</span>` : ''}</button>`).join('')}</div><div id="bb"></div>`;
+  $$('[data-b]').forEach(b => b.onclick = () => { ui.bellTab = b.dataset.b; viewBell(); });
+  const bb = $('#bb');
+  if (ui.bellTab !== 'edits') { bb.innerHTML = '<div class="card empty">قريبًا 🚧<br><span class="small">الجزء ده في المراحل الجاية</span></div>'; return; }
+  bb.innerHTML = '<div class="loading">جاري التحميل…</div>';
+  const { data, error } = await sb.from('edit_requests').select('*, teachers(name,phone,avatar)').in('status', ['pending', 'question']).order('updated_at').limit(40);
+  if (error) { bb.innerHTML = `<div class="alert">${esc(errMsg(error))}</div>`; return; }
+  const pend = data.filter(e => e.status === 'pending'), q = data.filter(e => e.status === 'question');
+  bb.innerHTML = (pend.map(e => reviewCard(e)).join('') || '<div class="card empty">مفيش تعديلات مستنية ✅</div>')
+    + (q.length ? `<details class="card"><summary><b>❓ مستنيين رد المدرس (${q.length})</b></summary>${q.map(e => reviewCard(e)).join('')}</details>` : '')
+    + (data.length === 40 ? '<div class="small muted">بيظهر أول 40 — راجعهم وهيظهر الباقي.</div>' : '');
+  bindReviews(bb);
+}
+
+/* ---------- إعدادات المالك ---------- */
+function meter(pct) { const c = pct > 90 ? 'r' : pct > 75 ? 'y' : ''; return `<div class="meter"><i class="${c}" style="width:${Math.min(100, pct).toFixed(1)}%"></i></div>`; }
+function dot(pct) { return pct > 90 ? '🔴' : pct > 75 ? '🟡' : '🟢'; }
+async function viewSettings() {
+  setHeader('⚙️ إعدادات المالك', false); app.innerHTML = '<div class="loading">جاري التحميل…</div>';
+  const { data, error } = await sb.rpc('usage_stats');
+  if (error) { app.innerHTML = `<div class="alert">${esc(errMsg(error))}</div>`; return; }
+  const lim = +(data.settings.db_limit_mb || 500), quota = +(data.settings.rep_quota_mb || 100);
+  const dbPct = data.db_bytes / (lim * MB) * 100, c = getCfg();
+  app.innerHTML = `<div class="card"><h3>${dot(dbPct)} مساحة القاعدة</h3>${(data.db_bytes / MB).toFixed(1)} من ${lim} ميجا (${dbPct.toFixed(1)}%)${meter(dbPct)}
+    ${dbPct > 75 ? '<div class="small" style="color:var(--bad);margin-top:6px">المساحة قربت تخلص — امسح الصور/الرسايل القديمة أو انقل مندوب لقاعدة لوحده.</div>' : ''}</div>
+  <div class="card"><div style="display:flex;align-items:center"><h3 class="grow" style="flex:1">المناديب والاستهلاك</h3><button class="btn sm pri" id="newRep">➕ مندوب جديد</button></div>
+    ${data.staff.map(s => { const pct = s.bytes / (quota * MB) * 100; return `<div class="kv" style="display:block;padding:10px 0" data-s="${s.id}">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><b>${dot(pct)} ${esc(s.name)}</b>${s.role === 'admin' ? '<span class="pill ok">المالك</span>' : `<span class="pill new" dir="ltr">${esc(s.rep_code || '')}</span>${s.linked ? '<span class="pill ok">📱 متربط</span>' : '<span class="pill owe">لسه ما دخلش</span>'}`}${s.active ? '' : '<span class="pill bad">⛔ موقوف</span>'}</div>
+      <div class="small muted">${s.teachers} مدرس · ${s.pending} تعديل مستني · ${s.notes} ملاحظة · ${(s.bytes / 1024).toFixed(0)} ك.ب (${pct.toFixed(1)}% من ${quota} ميجا)</div>${meter(pct)}
+      ${s.role === 'rep' ? `<div class="acts"><button class="btn sm" data-a="copy">📋 الرقم</button><button class="btn sm ok" data-a="wa">🟢 ابعته</button><button class="btn sm ghost" data-a="unlink">🔓 فك الجهاز</button>
+        <button class="btn sm ghost" data-a="newcode">🔁 رقم جديد</button><button class="btn sm ghost" data-a="rename">✏️ الاسم</button><button class="btn sm ${s.active ? 'danger' : 'ok'}" data-a="toggle">${s.active ? '⛔ إيقاف' : '✅ تشغيل'}</button></div>` : ''}</div>`; }).join('')}</div>
+  <div class="card"><h3>حدود المساحة</h3><div class="row2"><div class="field"><label>حد القاعدة (ميجا)</label><input id="lim" type="number" value="${lim}"></div>
+    <div class="field"><label>نصيب المندوب (ميجا)</label><input id="quo" type="number" value="${quota}"></div></div><button class="btn sm" id="saveLim">حفظ</button>
+    <div class="hint small muted">🟢 عادي · 🟡 فوق 75% · 🔴 فوق 90%</div></div>
+  <details class="card"><summary><b>🔑 كود إعداد القاعدة دي</b></summary><div class="small muted" style="margin:6px 0">للمستقبل: لما مندوب يبقى ليه قاعدة لوحده، بتبعتله كود قاعدته يلصقه في شاشة الدخول.</div>
+    <button class="btn sm" id="cpCfg">📋 انسخ الكود</button></details>
+  <div class="card"><div class="kv"><span>دخلت كـ</span><span>${esc(me.name)}</span></div><div class="kv"><span>القاعدة</span><span class="small" dir="ltr">${esc((c.url || '').replace('https://', ''))}</span></div></div>`;
+  const repsUrl = location.href.split('#')[0].replace(/admin\.html.*$/, '') + 'index.html';
+  const repMsg = s => `رقمك السري في «سلاح التلميذ - نسخة التجربة»: ${s.rep_code}\nافتح: ${repsUrl}\nواضغط تبويب 💬 المراسلات واكتب الرقم. (بيشتغل على موبايل واحد بس)`;
+  $('#newRep').onclick = async () => {
+    const name = await ask('اسم المندوب', { multi: false }); if (!name) return;
+    const { data: code, error: e } = await sb.rpc('admin_create_rep', { p_name: name }); if (e) return toast(errMsg(e));
+    await loadAll(); viewSettings();
+    modal(`<h3>✅ اتعمل رقم سري لـ ${esc(name)}</h3><div style="font-size:30px;text-align:center;letter-spacing:4px;font-weight:800" dir="ltr">${code}</div>
+      <div class="acts"><button class="btn" id="c1">📋 انسخ الرسالة</button><a class="btn ok" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(repMsg({ rep_code: code }))}">🟢 ابعته واتساب</a><button class="btn ghost" data-close>قفل</button></div>`,
+      box => { $('#c1', box).onclick = () => copyText(repMsg({ rep_code: code })); });
+  };
+  $$('[data-s] [data-a]').forEach(b => b.onclick = async () => {
+    const s = data.staff.find(x => x.id === b.closest('[data-s]').dataset.s), a = b.dataset.a; let r;
+    if (a === 'copy') return copyText(s.rep_code);
+    if (a === 'wa') return window.open('https://wa.me/?text=' + encodeURIComponent(repMsg(s)), '_blank');
+    if (a === 'unlink') { if (!confirm(`فك ربط موبايل ${s.name}؟ هيقدر يدخل بنفس الرقم من موبايل جديد.`)) return; r = await sb.rpc('admin_reset_rep', { p_id: s.id, p_new_code: false }); }
+    if (a === 'newcode') { if (!confirm(`رقم سري جديد لـ ${s.name}؟ القديم هيبطل.`)) return; r = await sb.rpc('admin_reset_rep', { p_id: s.id, p_new_code: true }); }
+    if (a === 'rename') { const n = await ask('الاسم الجديد', { multi: false, val: s.name }); if (!n) return; r = await sb.from('staff').update({ name: n }).eq('id', s.id); }
+    if (a === 'toggle') { if (s.active && !confirm(`إيقاف ${s.name}؟ مش هيقدر يدخل لحد ما تشغله.`)) return; r = await sb.from('staff').update({ active: !s.active }).eq('id', s.id); }
+    if (r && r.error) return toast(errMsg(r.error));
+    await loadAll(); viewSettings(); toast('تمام ✅');
+  });
+  $('#saveLim').onclick = async () => {
+    const { error: e } = await sb.from('app_settings').upsert([{ key: 'db_limit_mb', value: +$('#lim').value || 500 }, { key: 'rep_quota_mb', value: +$('#quo').value || 100 }]);
+    if (e) return toast(errMsg(e)); viewSettings(); toast('اتحفظ ✅');
+  };
+  $('#cpCfg').onclick = () => copyText(encodeCfg(c.url, c.key));
+}
+
+boot();
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
+</script>
+</body>
+</html>

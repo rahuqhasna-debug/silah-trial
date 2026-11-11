@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<title>سلاح التلميذ - ملفي</title>
+<link rel="manifest" href="teacher.webmanifest">
+<link rel="icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="common.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+</head>
+<body>
+<div class="trialbar">🧪 نسخة التجربة</div>
+<header class="top"><div class="in"><h1 id="title">سلاح التلميذ</h1><button class="hb" id="reload" aria-label="تحديث">🔄</button></div></header>
+<main class="wrap" id="app"><div class="loading">جاري التحميل…</div></main>
+<nav class="tabs" id="tabs" hidden>
+  <a data-v="home"><span class="i">🏠</span>الرئيسية<span class="cnt" id="homeCnt" hidden></span></a>
+  <a data-v="msgs"><span class="i">💬</span>الرسائل</a>
+  <a data-v="me"><span class="i">👤</span>ملفي</a>
+</nav>
+<script>
+"use strict";
+const TCFG = 'selah-trial-tcfg', TCODE = 'selah-trial-tcode';
+// الكود من الرابط teacher.html#c=CODE (&p=إعداد قاعدة مختلفة) ويتحفظ على الموبايل
+(function () {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('p')) { const c = decodeCfg(h.get('p')); if (c) LS.set(TCFG, c); }
+  if (h.get('c')) { LS.set(TCODE, h.get('c').trim()); history.replaceState(null, '', location.pathname); }
+})();
+const code = LS.get(TCODE);
+const sb = makeClient(false, TCFG);
+const app = $('#app');
+let D = null, view = 'home', newPhotos = [], st = {};
+
+function vals() { return { ...(D.profile || {}), avatar: D.avatar || '' }; }
+
+async function load() {
+  if (!sb) { app.innerHTML = '<div class="alert">البرنامج لسه مش متظبط. كلّم المندوب.</div>'; return; }
+  if (!code) { app.innerHTML = '<div class="alert"><h3>افتح الرابط اللي وصلك من المندوب</h3>الرابط ده لازم يكون فيه الكود الخاص بيك.</div>'; return; }
+  try {
+    const { data, error } = await sb.rpc('t_get', { p_code: code });
+    if (error) throw error;
+    if (!data) { app.innerHTML = '<div class="alert"><h3>الرابط ده مش شغال</h3>كلّم المندوب يبعتلك رابط جديد.</div>'; $('#tabs').hidden = true; return; }
+    D = data; $('#tabs').hidden = false; render();
+  } catch (e) {
+    app.innerHTML = `<div class="alert">${esc(errMsg(e))}</div><button class="btn" onclick="load()">حاول تاني</button>`;
+  }
+}
+function go(v) { view = v; render(); scrollTo(0, 0); }
+function render() {
+  $$('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.v === view));
+  const n = D.updates.length + (D.pending && D.pending.status === 'question' ? 1 : 0);
+  $('#homeCnt').hidden = !n; $('#homeCnt').textContent = n;
+  $('#title').textContent = view === 'me' ? 'ملفي' : view === 'msgs' ? 'الرسائل' : 'أهلًا ' + (D.name || '');
+  if (view === 'me') renderMe(); else if (view === 'msgs') app.innerHTML = '<div class="card empty">💬 المراسلات مع المندوب<br><b>قريبًا</b></div>';
+  else renderHome();
+}
+
+function fieldsTxt(keys) { return keys.map(k => FIELD_LABEL[k] || k).join('، '); }
+function valsList(o) {
+  return Object.keys(o || {}).map(k => `<div class="kv"><span>${FIELD_LABEL[k] || k}</span><span>${fmtVal(k, o[k])}</span></div>`).join('');
+}
+function renderHome() {
+  const v = vals(); let h = `<div class="card" style="display:flex;align-items:center;gap:12px">${v.avatar ? `<img class="av lg" src="${v.avatar}" alt="">` : '<span class="av lg">👤</span>'}
+    <div><b style="font-size:19px">${esc(D.name)}</b><div class="muted small">${esc([v.subject, v.city, v.gov].filter(Boolean).join(' · '))}</div></div></div>`;
+  for (const u of D.updates) h += `<div class="alert"><h3>📝 مطلوب تحديث بياناتك</h3>${esc(fieldsTxt(u.fields || []))}${u.note ? `<div style="margin-top:6px">«${esc(u.note)}»</div>` : ''}
+    <div class="acts"><button class="btn danger" onclick="go('me')">حدّث دلوقتي ←</button></div></div>`;
+  const p = D.pending;
+  if (p && p.status === 'question') h += `<div class="note"><h3 style="margin:0 0 6px">❓ سؤال من المندوب على تعديلك</h3>«${esc(p.reason || '')}»
+    <textarea id="reply" placeholder="اكتب ردك هنا…" style="margin-top:8px"></textarea>
+    <div class="acts"><button class="btn owe" id="sendReply">ابعت الرد</button><button class="btn ghost" onclick="go('me')">عدّل ملفي</button></div></div>`;
+  else if (p) h += `<div class="note"><b>⏳ تعديلك في انتظار المراجعة</b><div class="small" style="margin-top:4px">${esc(fieldsTxt(Object.keys(p.new_values || {})))}${p.photos ? ` + ${p.photos} صورة` : ''}</div></div>`;
+  if (D.decisions.length) {
+    h += '<div class="card"><h3>آخر القرارات على تعديلاتك</h3>';
+    for (const d of D.decisions) {
+      if (d.status === 'rejected') h += `<div class="alert" style="margin:8px 0 0">❌ اترفض تعديل (${esc(fieldsTxt(Object.keys(d.new_values || {})))})${d.reason ? `<br>السبب: ${esc(d.reason)}` : ''}<div class="small">${fmtDate(d.at)}</div></div>`;
+      else {
+        const edited = Object.keys(d.final_values || {}).filter(k => JSON.stringify(d.final_values[k]) !== JSON.stringify((d.new_values || {})[k]));
+        h += `<div class="good" style="margin:8px 0 0">✅ اتوافق على تعديلك (${esc(fieldsTxt(Object.keys(d.final_values || {})))})
+          ${edited.length ? `<div class="small" style="margin-top:4px">✏️ المندوب عدّل قبل الموافقة:</div>${valsList(Object.fromEntries(edited.map(k => [k, d.final_values[k]])))}` : ''}
+          ${d.reason ? `<div class="small">ملاحظة: ${esc(d.reason)}</div>` : ''}<div class="small">${fmtDate(d.at)}</div></div>`;
+      }
+    }
+    h += '</div>';
+  }
+  if (!D.updates.length && !p && !D.decisions.length) h += '<div class="card empty">مفيش جديد 👌<br><button class="btn" style="margin-top:10px" onclick="go(\'me\')">افتح ملفي</button></div>';
+  app.innerHTML = h;
+  const sr = $('#sendReply');
+  sr && (sr.onclick = async () => {
+    const r = $('#reply').value.trim(); if (!r) return toast('اكتب الرد الأول');
+    sr.disabled = true;
+    const { error } = await sb.rpc('t_submit', { p_code: code, p_values: {}, p_photos: [], p_reply: r });
+    if (error) { sr.disabled = false; return toast(errMsg(error)); }
+    toast('اتبعت ✅'); load();
+  });
+}
+
+function renderMe() {
+  const req = new Set(D.updates.flatMap(u => u.fields || []));
+  const pend = D.pending ? D.pending.new_values : null;
+  st = {};
+  app.innerHTML = `<div class="card"><div class="muted small" style="margin-bottom:10px">أي تعديل بيروح للمندوب يراجعه الأول، وبعد الموافقة يتعتمد.</div>
+    <form id="pf" onsubmit="return false">${profileForm(vals(), { req, pend })}
+    <div class="field${req.has('photos') ? ' req' : ''}"><label>📷 صور إضافية (اختياري — بعدد مفتوح)${req.has('photos') ? ' <span class="pill bad">مطلوب</span>' : ''}</label>
+      <div class="photos" id="phs"></div>
+      <label class="btn sm" style="margin-top:8px">➕ زوّد صور<input type="file" accept="image/*" multiple id="phIn" hidden></label>
+      ${D.pending && D.pending.photos ? `<div class="pend">⏳ ${D.pending.photos} صورة في انتظار المراجعة</div>` : ''}</div>
+    <button class="btn pri" id="save" style="width:100%;padding:14px">💾 ابعت التعديل للمراجعة</button></form></div>`;
+  const f = $('#pf'); bindProfileForm(f, st); drawPhotos();
+  $('#phIn').onchange = async e => {
+    const files = [...e.target.files]; e.target.value = '';
+    for (const fl of files) { try { newPhotos.push(await compressImage(fl, 1280, 60000)); drawPhotos(); } catch (er) { toast(errMsg(er)); } }
+  };
+  $('#save').onclick = async () => {
+    const ch = changedOnly(vals(), readProfileForm(f, st));
+    if (!Object.keys(ch).length && !newPhotos.length) return toast('مفيش تغيير');
+    if ('name' in ch && !String(ch.name).trim()) return toast('الاسم مينفعش يبقى فاضي');
+    const b = $('#save'); b.disabled = true; b.textContent = 'جاري الإرسال…';
+    const { error } = await sb.rpc('t_submit', { p_code: code, p_values: ch, p_photos: newPhotos, p_reply: null });
+    if (error) { b.disabled = false; b.textContent = '💾 ابعت التعديل للمراجعة'; return toast(errMsg(error)); }
+    newPhotos = []; toast('اتبعت للمراجعة ✅'); view = 'home'; load();
+  };
+  const first = $('.field.req'); first && first.scrollIntoView({ block: 'center' });
+}
+function drawPhotos() {
+  const box = $('#phs'); if (!box) return;
+  box.innerHTML = newPhotos.map((p, i) => `<div class="ph"><img src="${p}" alt=""><button type="button" class="x" data-i="${i}">✕</button></div>`).join('');
+  $$('.x', box).forEach(b => b.onclick = () => { newPhotos.splice(+b.dataset.i, 1); drawPhotos(); });
+}
+
+$$('#tabs a').forEach(a => a.onclick = () => go(a.dataset.v));
+$('#reload').onclick = () => load();
+load();
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
+</script>
+</body>
+</html>
